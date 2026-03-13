@@ -29,6 +29,7 @@ WATCH_DIR = Path(
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 KIKITORU_CMD = os.environ.get("KIKITORU_CMD", "kikitoru")
+MEDIA_DIR = os.environ.get("MEDIA_DIR", "")
 
 # ログ設定
 LOG_DIR = Path("~/.kikiwatch").expanduser()
@@ -118,8 +119,16 @@ def wait_for_stable_size(file_path: Path) -> bool:
 
 
 def run_kikitoru(file_path: Path) -> None:
-    """kikitoru --use-db <ファイルパス> を実行する。"""
-    cmd = [KIKITORU_CMD, "--use-db", str(file_path)]
+    """kikitoru transcribe --use-db <ファイルパス> を実行する。"""
+    cmd = [KIKITORU_CMD, "transcribe", "--use-db", str(file_path)]
+    env = os.environ.copy()
+    if DATABASE_URL:
+        env["KIKITORU_DB_URL"] = DATABASE_URL
+    hf_token = os.environ.get("HF_TOKEN", "")
+    if hf_token:
+        env["HF_TOKEN"] = hf_token
+    if MEDIA_DIR:
+        env["KIKITORU_MEDIA_DIR"] = MEDIA_DIR
     logger.info("kikitoru 実行開始: %s", " ".join(cmd))
     try:
         result = subprocess.run(
@@ -127,6 +136,7 @@ def run_kikitoru(file_path: Path) -> None:
             capture_output=True,
             text=True,
             encoding="utf-8",
+            env=env,
         )
         if result.returncode == 0:
             logger.info("kikitoru 正常終了: %s", file_path.name)
