@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sakurahirahira.kikiwatch</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Volumes/SanDisk/code_dev/0015_kikiwatch/watcher.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Volumes/SanDisk/code_dev/0015_kikiwatch</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/PLACEHOLDER_USER/.kikiwatch/kikiwatch.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/PLACEHOLDER_USER/.kikiwatch/kikiwatch.log</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DATABASE_URL</key>
+        <string>postgresql://kikitoru:dev_password@localhost:5433/kikitoru_dev</string>
+        <key>KIKITORU_CMD</key>
+        <string>kikitoru</string>
+    </dict>
+</dict>
+</plist>
