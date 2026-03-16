@@ -120,7 +120,7 @@ def wait_for_stable_size(file_path: Path) -> bool:
 
 def run_kikitoru(file_path: Path) -> None:
     """kikitoru transcribe --use-db <ファイルパス> を実行する。"""
-    cmd = [KIKITORU_CMD, "transcribe", "--use-db", str(file_path)]
+    cmd = ["caffeinate", "-i", KIKITORU_CMD, "transcribe", "--use-db", str(file_path)]
     env = os.environ.copy()
     if DATABASE_URL:
         env["KIKITORU_DB_URL"] = DATABASE_URL
