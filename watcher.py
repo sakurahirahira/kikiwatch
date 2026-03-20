@@ -313,7 +313,12 @@ def scan_existing_files() -> None:
     for file_path in audio_files:
         try:
             file_hash = compute_md5(file_path)
-            if is_already_processed(file_hash):
+            # .qtaは変換後の.m4aファイル名でN100パスを照合
+            target_name = (file_path.stem + ".m4a"
+                           if file_path.suffix.lower() == ".qta"
+                           else file_path.name)
+            check_path = f"{REMOTE_MEDIA_DIR}/{target_name}" if REMOTE_MEDIA_DIR else ""
+            if is_already_processed(file_hash, check_path):
                 logger.debug("既処理済み（スキップ）: %s", file_path.name)
             else:
                 age_hours = (now - file_path.stat().st_mtime) / 3600
