@@ -6,10 +6,12 @@ kikiwatch - iCloud Voice Memos 自動監視・kikitoru連携デーモン
 import hashlib
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import psycopg2
 from dotenv import load_dotenv
@@ -27,9 +29,22 @@ WATCH_DIR = Path(
     )
 ).expanduser()
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
+# KIKIWATCH_ENV=dev → 開発DB、KIKIWATCH_ENV=prod → 本番DB
+_env = os.environ.get("KIKIWATCH_ENV", "prod").strip().lower()
+if _env == "dev":
+    DATABASE_URL = os.environ.get("DATABASE_URL_DEV", "")
+    MEDIA_DIR = os.environ.get("MEDIA_DIR_DEV", "")
+    REMOTE_HOST = ""
+    REMOTE_MEDIA_DIR = ""
+else:
+    DATABASE_URL = os.environ.get("DATABASE_URL_PROD", "")
+    MEDIA_DIR = os.environ.get("MEDIA_DIR_DEV", "")   # ローカルで処理してN100へSCP
+    REMOTE_HOST = os.environ.get("REMOTE_HOST", "")
+    REMOTE_MEDIA_DIR = os.environ.get("REMOTE_MEDIA_DIR", "")
+
 KIKITORU_CMD = os.environ.get("KIKITORU_CMD", "kikitoru")
-MEDIA_DIR = os.environ.get("MEDIA_DIR", "")
+
+SUPPORTED_EXTENSIONS = {".m4a", ".qta"}
 
 # ログ設定
 LOG_DIR = Path("~/.kikiwatch").expanduser()
@@ -118,10 +133,12 @@ def wait_for_stable_size(file_path: Path) -> bool:
     return False
 
 
-def run_kikitoru(file_path: Path) -> None:
-    """kikitoru transcribe --use-db <ファイルパス> を実行する。"""
+def run_kikitoru(file_path: Path) -> bool:
+    """kikitoru transcribe --use-db <ファイルパス> を実行する。成功時True。"""
     cmd = ["caffeinate", "-i", KIKITORU_CMD, "transcribe", "--use-db", str(file_path)]
     env = os.environ.copy()
+    # launchd は PATH が狭いので Homebrew パスを明示的に追加
+    env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + env.get("PATH", "")
     if DATABASE_URL:
         env["KIKITORU_DB_URL"] = DATABASE_URL
     hf_token = os.environ.get("HF_TOKEN", "")
@@ -129,6 +146,9 @@ def run_kikitoru(file_path: Path) -> None:
         env["HF_TOKEN"] = hf_token
     if MEDIA_DIR:
         env["KIKITORU_MEDIA_DIR"] = MEDIA_DIR
+    # prodモード: DBには最初からN100の最終パスを保存する
+    if REMOTE_MEDIA_DIR:
+        env["KIKITORU_FILE_PATH_OVERRIDE"] = f"{REMOTE_MEDIA_DIR}/{file_path.name}"
     logger.info("kikitoru 実行開始: %s", " ".join(cmd))
     try:
         result = subprocess.run(
@@ -142,21 +162,74 @@ def run_kikitoru(file_path: Path) -> None:
             logger.info("kikitoru 正常終了: %s", file_path.name)
             if result.stdout:
                 logger.debug("stdout:\n%s", result.stdout.strip())
+            return True
         else:
             logger.error(
                 "kikitoru 異常終了 (returncode=%d): %s", result.returncode, file_path.name
             )
             if result.stderr:
                 logger.error("stderr:\n%s", result.stderr.strip())
+            return False
     except FileNotFoundError:
         logger.error("kikitoru コマンドが見つかりません: %s", KIKITORU_CMD)
+        return False
     except Exception as e:
         logger.error("kikitoru 実行中にエラーが発生しました: %s", e)
+        return False
+
+
+def convert_qta_to_m4a(qta_path: Path) -> Optional[Path]:
+    """.qta ファイルを .m4a に変換する（AAC トラックを抽出）。"""
+    out_dir = Path(MEDIA_DIR) if MEDIA_DIR else qta_path.parent
+    out_path = out_dir / (qta_path.stem + ".m4a")
+    logger.info("qta→m4a 変換開始: %s → %s", qta_path.name, out_path.name)
+    try:
+        ffmpeg = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
+        result = subprocess.run(
+            [ffmpeg, "-i", str(qta_path), "-map", "0:0", "-c", "copy", str(out_path), "-y"],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode != 0:
+            logger.error("ffmpeg 変換失敗: %s", result.stderr.strip())
+            return None
+        logger.info("qta→m4a 変換完了: %s", out_path.name)
+        return out_path
+    except Exception as e:
+        logger.error("qta 変換中にエラー: %s", e)
+        return None
+
+
+def transfer_to_remote(local_path: Path) -> bool:
+    """音声ファイルをリモートサーバーへSCPで転送する。
+    DBのfile_pathはkikitoruがKIKITORU_FILE_PATH_OVERRIDEで最初から正しいパスを保存するため更新不要。
+    """
+    if not REMOTE_HOST or not REMOTE_MEDIA_DIR:
+        return False
+
+    remote_path = f"{REMOTE_MEDIA_DIR}/{local_path.name}"
+    logger.info("N100へ転送中: %s → %s:%s", local_path.name, REMOTE_HOST, remote_path)
+
+    try:
+        result = subprocess.run(
+            ["scp", str(local_path), f"{REMOTE_HOST}:{remote_path}"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            logger.error("SCP失敗: %s", result.stderr.strip())
+            return False
+        logger.info("SCP完了: %s", local_path.name)
+        return True
+    except Exception as e:
+        logger.error("SCP中にエラー: %s", e)
+        return False
 
 
 def process_file(file_path: Path) -> None:
-    """新規 .m4a ファイルを処理する。"""
-    if file_path.suffix.lower() != ".m4a":
+    """新規音声ファイルを処理する（.m4a / .qta 対応）。"""
+    ext = file_path.suffix.lower()
+    if ext not in SUPPORTED_EXTENSIONS:
         return
 
     logger.info("新規ファイル検知: %s", file_path.name)
@@ -165,7 +238,7 @@ def process_file(file_path: Path) -> None:
     if not wait_for_stable_size(file_path):
         return
 
-    # MD5 計算
+    # MD5 計算（元ファイルで重複チェック）
     try:
         file_hash = compute_md5(file_path)
     except Exception as e:
@@ -177,8 +250,22 @@ def process_file(file_path: Path) -> None:
         logger.info("既に処理済みのためスキップ: %s (hash=%s)", file_path.name, file_hash)
         return
 
-    # kikitoru 実行
-    run_kikitoru(file_path)
+    # .qta → .m4a 変換
+    if ext == ".qta":
+        target_path = convert_qta_to_m4a(file_path)
+        if target_path is None:
+            return
+    else:
+        target_path = file_path
+
+    # kikitoru 実行（成功時のみ転送）
+    success = run_kikitoru(target_path)
+
+    # N100へ音声ファイルを転送（DBパスはkikitoruが最初から正しいパスを保存済み）
+    if success and MEDIA_DIR:
+        local_media_path = Path(MEDIA_DIR) / target_path.name
+        if local_media_path.exists():
+            transfer_to_remote(local_media_path)
 
 
 class VoiceMemoHandler(FileSystemEventHandler):
@@ -194,23 +281,47 @@ class VoiceMemoHandler(FileSystemEventHandler):
             process_file(Path(event.dest_path))
 
 
-def scan_existing_files() -> None:
-    """起動時に既存ファイルを DB ハッシュと照合してスキップ確認（ログ出力のみ）。"""
-    logger.info("既存ファイルのスキャン開始: %s", WATCH_DIR)
-    m4a_files = list(WATCH_DIR.rglob("*.m4a"))
-    logger.info("既存 .m4a ファイル数: %d", len(m4a_files))
+RECENT_FILE_HOURS = 24  # 起動時に未処理として自動処理する対象のファイル作成からの時間
 
-    for file_path in m4a_files:
+
+def scan_existing_files() -> None:
+    """起動時に既存ファイルを DB ハッシュと照合し、最近の未処理ファイルを自動処理する。"""
+    import stat
+
+    logger.info("既存ファイルのスキャン開始: %s", WATCH_DIR)
+    audio_files = []
+    for ext in SUPPORTED_EXTENSIONS:
+        audio_files.extend(WATCH_DIR.rglob(f"*{ext}"))
+    logger.info("既存音声ファイル数: %d", len(audio_files))
+
+    now = time.time()
+    recent_unprocessed = []
+    for file_path in audio_files:
         try:
             file_hash = compute_md5(file_path)
             if is_already_processed(file_hash):
                 logger.debug("既処理済み（スキップ）: %s", file_path.name)
             else:
-                logger.info("未処理ファイル検出（監視中に変化があれば処理）: %s", file_path.name)
+                age_hours = (now - file_path.stat().st_mtime) / 3600
+                if age_hours <= RECENT_FILE_HOURS:
+                    logger.info(
+                        "未処理ファイル検出（自動処理します）: %s (%.1fh前)",
+                        file_path.name, age_hours,
+                    )
+                    recent_unprocessed.append(file_path)
+                else:
+                    logger.debug(
+                        "未処理ファイル（古いためスキップ）: %s (%.0fh前)",
+                        file_path.name, age_hours,
+                    )
         except Exception as e:
             logger.warning("既存ファイルスキャン中にエラー: %s - %s", file_path.name, e)
 
-    logger.info("既存ファイルのスキャン完了")
+    logger.info("既存ファイルのスキャン完了（自動処理対象: %d件）", len(recent_unprocessed))
+
+    for file_path in recent_unprocessed:
+        logger.info("起動時リトライ処理: %s", file_path.name)
+        process_file(file_path)
 
 
 def main() -> None:
@@ -218,7 +329,8 @@ def main() -> None:
         logger.error("監視ディレクトリが存在しません: %s", WATCH_DIR)
         sys.exit(1)
 
-    logger.info("kikiwatch 起動")
+    logger.info("kikiwatch 起動 [環境: %s]", _env.upper())
+    logger.info("DB接続先: %s", DATABASE_URL.split("@")[-1] if DATABASE_URL else "(未設定)")
     logger.info("監視ディレクトリ: %s", WATCH_DIR)
     logger.info("kikitoru コマンド: %s", KIKITORU_CMD)
     logger.info("ログファイル: %s", LOG_FILE)
