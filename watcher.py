@@ -76,8 +76,11 @@ def compute_md5(file_path: Path) -> str:
     return h.hexdigest()
 
 
-def is_already_processed(file_hash: str) -> bool:
-    """DB で二重処理チェックを行う。"""
+def is_already_processed(file_hash: str, check_path: str = "") -> bool:
+    """DB で二重処理チェックを行う。
+    file_hashで照合し、見つからない場合はcheck_pathでも照合する
+    （KIKITORU_FILE_PATH_OVERRIDEでfile_hashがNULL登録される場合の対策）。
+    """
     if not DATABASE_URL:
         logger.warning("DATABASE_URL が未設定のため二重処理チェックをスキップします")
         return False
@@ -89,7 +92,15 @@ def is_already_processed(file_hash: str) -> bool:
                     "SELECT id FROM recordings WHERE file_hash = %s AND user_id = 1",
                     (file_hash,),
                 )
-                return cur.fetchone() is not None
+                if cur.fetchone() is not None:
+                    return True
+                if check_path:
+                    cur.execute(
+                        "SELECT id FROM recordings WHERE file_path = %s AND user_id = 1",
+                        (check_path,),
+                    )
+                    return cur.fetchone() is not None
+                return False
         finally:
             conn.close()
     except Exception as e:
@@ -238,25 +249,28 @@ def process_file(file_path: Path) -> None:
     if not wait_for_stable_size(file_path):
         return
 
-    # MD5 計算（元ファイルで重複チェック）
-    try:
-        file_hash = compute_md5(file_path)
-    except Exception as e:
-        logger.error("MD5 計算中にエラーが発生しました: %s", e)
-        return
-
-    # 二重処理チェック
-    if is_already_processed(file_hash):
-        logger.info("既に処理済みのためスキップ: %s (hash=%s)", file_path.name, file_hash)
-        return
-
-    # .qta → .m4a 変換
+    # .qta → .m4a 変換（MD5チェック前に変換してm4aのハッシュで照合）
     if ext == ".qta":
         target_path = convert_qta_to_m4a(file_path)
         if target_path is None:
             return
     else:
         target_path = file_path
+
+    # MD5 計算（変換後ファイルで重複チェック）
+    try:
+        file_hash = compute_md5(target_path)
+    except Exception as e:
+        logger.error("MD5 計算中にエラーが発生しました: %s", e)
+        return
+
+    # N100最終パスでの照合パス（KIKITORU_FILE_PATH_OVERRIDE使用時の重複チェック用）
+    check_path = f"{REMOTE_MEDIA_DIR}/{target_path.name}" if REMOTE_MEDIA_DIR else ""
+
+    # 二重処理チェック
+    if is_already_processed(file_hash, check_path):
+        logger.info("既に処理済みのためスキップ: %s", file_path.name)
+        return
 
     # kikitoru 実行（成功時のみ転送）
     success = run_kikitoru(target_path)
