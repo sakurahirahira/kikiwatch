@@ -144,6 +144,29 @@ def wait_for_stable_size(file_path: Path) -> bool:
     return False
 
 
+def get_custom_vocabulary() -> Optional[str]:
+    """settings テーブルから custom_vocabulary を取得して initial_prompt 文字列を返す。"""
+    if not DATABASE_URL:
+        return None
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM settings WHERE key = 'custom_vocabulary' AND user_id = 1"
+                )
+                row = cur.fetchone()
+            if row and row[0].strip():
+                words = [w.strip() for w in row[0].replace('、', ',').split(',') if w.strip()]
+                return '、'.join(words) if words else None
+            return None
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("カスタム辞書の取得に失敗しました: %s", e)
+        return None
+
+
 def run_kikitoru(file_path: Path) -> bool:
     """kikitoru transcribe --use-db <ファイルパス> を実行する。成功時True。"""
     cmd = ["caffeinate", "-i", KIKITORU_CMD, "transcribe", "--use-db", str(file_path)]
@@ -160,6 +183,11 @@ def run_kikitoru(file_path: Path) -> bool:
     # prodモード: DBには最初からN100の最終パスを保存する
     if REMOTE_MEDIA_DIR:
         env["KIKITORU_FILE_PATH_OVERRIDE"] = f"{REMOTE_MEDIA_DIR}/{file_path.name}"
+    # カスタム辞書があれば --initial-prompt として渡す
+    vocab = get_custom_vocabulary()
+    if vocab:
+        cmd += ["--initial-prompt", vocab]
+        logger.info("カスタム辞書を使用: %s", vocab)
     logger.info("kikitoru 実行開始: %s", " ".join(cmd))
     try:
         result = subprocess.run(
