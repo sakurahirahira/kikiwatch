@@ -371,7 +371,152 @@ def scan_existing_files() -> None:
         process_file(file_path)
 
 
+RETRANSCRIBE_POLL_INTERVAL = 30  # 秒
+
+
+def process_retranscribe_job(conn, job: dict) -> None:
+    """DB キューから取り出した再文字起こしジョブを処理する。"""
+    import tempfile
+    job_id = job["id"]
+    recording_id = job["recording_id"]
+    model = job["model"]
+    clustering_threshold = job["clustering_threshold"]
+    normalize = job["normalize"]
+
+    def update_job(status=None, phase=None, progress=None, error=None):
+        fields, values = [], []
+        if status is not None:
+            fields.append("status = %s"); values.append(status)
+            if status == "processing":
+                fields.append("started_at = NOW()")
+            elif status in ("completed", "failed"):
+                fields.append("completed_at = NOW()")
+        if phase is not None:
+            fields.append("phase = %s"); values.append(phase)
+        if progress is not None:
+            fields.append("progress = %s"); values.append(progress)
+        if error is not None:
+            fields.append("error = %s"); values.append(error)
+        values.append(job_id)
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE retranscribe_jobs SET {', '.join(fields)} WHERE id = %s", values)
+        conn.commit()
+
+    try:
+        # ファイルパスを取得
+        with conn.cursor() as cur:
+            cur.execute("SELECT file_path FROM recordings WHERE id = %s", (recording_id,))
+            row = cur.fetchone()
+        if not row:
+            update_job(status="failed", error="Recording not found")
+            return
+        remote_file_path = row[0]
+
+        update_job(status="processing", phase="転送中", progress=3)
+
+        # N100から音声ファイルをMacへSCPでダウンロード
+        file_name = Path(remote_file_path).name
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_tmp = Path(tmpdir) / file_name
+            scp_result = subprocess.run(
+                ["scp", f"{REMOTE_HOST}:{remote_file_path}", str(local_tmp)],
+                capture_output=True, text=True,
+            )
+            if scp_result.returncode != 0:
+                update_job(status="failed", error=f"SCP failed: {scp_result.stderr[:200]}")
+                return
+
+            update_job(phase="文字起こし中", progress=8)
+
+            # kikitoru コマンド構築
+            cmd = ["caffeinate", "-i", KIKITORU_CMD, "transcribe", "--use-db", str(local_tmp), "--enhance"]
+            if normalize:
+                cmd.append("--normalize")
+            if model:
+                cmd += ["--model", model]
+            if clustering_threshold is not None:
+                cmd += ["--clustering-threshold", str(clustering_threshold)]
+            vocab = get_custom_vocabulary()
+            if vocab:
+                cmd += ["--initial-prompt", vocab]
+
+            env = os.environ.copy()
+            env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + env.get("PATH", "")
+            env["KIKITORU_DB_URL"] = DATABASE_URL
+            if os.environ.get("HF_TOKEN"):
+                env["HF_TOKEN"] = os.environ["HF_TOKEN"]
+            # DBには元のN100パスを保存する
+            env["KIKITORU_FILE_PATH_OVERRIDE"] = remote_file_path
+
+            phase_map = [
+                ("[0/4]",        "音量均一化中",           5),
+                ("[0.5/4]",      "音声強調中",             10),
+                ("[1/4]",        "前処理中",               15),
+                ("[2/4]",        "話者分離中",             25),
+                ("[3/4]",        "文字起こし中",           40),
+                ("[4/4]",        "話者ラベル割り当て中",   75),
+                ("[DB] 声紋",    "声紋抽出中",             85),
+                ("[DB] データ",  "DB保存中",               92),
+                ("[DB] 保存完了","完了",                   100),
+            ]
+
+            logger.info("再文字起こし開始: recording_id=%d job_id=%s", recording_id, job_id)
+            proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            for line in proc.stdout:
+                line = line.rstrip()
+                for key, phase, progress in phase_map:
+                    if key in line:
+                        update_job(phase=phase, progress=progress)
+                        break
+            proc.wait()
+
+            if proc.returncode == 0:
+                update_job(status="completed", phase="完了", progress=100)
+                logger.info("再文字起こし完了: recording_id=%d", recording_id)
+            else:
+                update_job(status="failed", error=f"kikitoru returncode={proc.returncode}")
+                logger.error("再文字起こし失敗: recording_id=%d returncode=%d", recording_id, proc.returncode)
+
+    except Exception as e:
+        logger.error("再文字起こしジョブエラー: %s", e)
+        try:
+            update_job(status="failed", error=str(e)[:200])
+        except Exception:
+            pass
+
+
+def poll_retranscribe_jobs() -> None:
+    """pending ジョブを DB から取り出して処理する（バックグラウンドスレッドから呼ばれる）。"""
+    if not DATABASE_URL:
+        return
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id, recording_id, model, clustering_threshold, normalize
+                    FROM retranscribe_jobs
+                    WHERE status = 'pending'
+                    ORDER BY created_at
+                    LIMIT 1
+                """)
+                row = cur.fetchone()
+            if row is None:
+                return
+            job = {
+                "id": row[0], "recording_id": row[1],
+                "model": row[2], "clustering_threshold": row[3], "normalize": row[4],
+            }
+            process_retranscribe_job(conn, job)
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error("ジョブポーリングエラー: %s", e)
+
+
 def main() -> None:
+    import threading
+
     if not WATCH_DIR.exists():
         logger.error("監視ディレクトリが存在しません: %s", WATCH_DIR)
         sys.exit(1)
@@ -384,6 +529,16 @@ def main() -> None:
 
     # 既存ファイルスキャン
     scan_existing_files()
+
+    # 再文字起こしジョブポーリングスレッド
+    def _retranscribe_loop():
+        while True:
+            time.sleep(RETRANSCRIBE_POLL_INTERVAL)
+            poll_retranscribe_jobs()
+
+    retranscribe_thread = threading.Thread(target=_retranscribe_loop, daemon=True)
+    retranscribe_thread.start()
+    logger.info("再文字起こしジョブポーリング開始 (interval=%ds)", RETRANSCRIBE_POLL_INTERVAL)
 
     # FSEvents 監視開始
     event_handler = VoiceMemoHandler()
