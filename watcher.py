@@ -265,6 +265,66 @@ def transfer_to_remote(local_path: Path) -> bool:
         return False
 
 
+def _enqueue_scp_pending(local_path: Path) -> None:
+    """SCP失敗ファイルを保留キューに追加する。"""
+    import json
+    entry = {"local_path": str(local_path), "failed_at": time.time()}
+    try:
+        with open(SCP_PENDING_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        logger.info("SCP保留キューに追加: %s", local_path.name)
+    except Exception as e:
+        logger.error("SCP保留キュー書き込みエラー: %s", e)
+
+
+def poll_scp_pending() -> None:
+    """保留中のSCPファイルをリトライする（バックグラウンドスレッドから呼ばれる）。"""
+    import json
+    if not SCP_PENDING_FILE.exists():
+        return
+
+    try:
+        with open(SCP_PENDING_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception as e:
+        logger.error("SCP保留キュー読み込みエラー: %s", e)
+        return
+
+    if not lines:
+        return
+
+    remaining = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+            local_path = Path(entry["local_path"])
+        except Exception:
+            continue  # 壊れた行はスキップして削除
+
+        if not local_path.exists():
+            logger.warning("SCP保留ファイルが見つかりません（スキップ）: %s", local_path.name)
+            continue  # ファイルなければキューから削除
+
+        logger.info("SCPリトライ: %s", local_path.name)
+        if transfer_to_remote(local_path):
+            logger.info("SCPリトライ成功: %s", local_path.name)
+        else:
+            remaining.append(line)  # 失敗したままキューに残す
+
+    # キューを更新（成功分を除いて書き直し）
+    if remaining:
+        with open(SCP_PENDING_FILE, "w", encoding="utf-8") as f:
+            f.write("\n".join(remaining) + "\n")
+    else:
+        try:
+            SCP_PENDING_FILE.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def process_file(file_path: Path) -> None:
     """新規音声ファイルを処理する（.m4a / .qta 対応）。"""
     ext = file_path.suffix.lower()
@@ -307,7 +367,8 @@ def process_file(file_path: Path) -> None:
     if success and MEDIA_DIR:
         local_media_path = Path(MEDIA_DIR) / target_path.name
         if local_media_path.exists():
-            transfer_to_remote(local_media_path)
+            if not transfer_to_remote(local_media_path):
+                _enqueue_scp_pending(local_media_path)
 
 
 class VoiceMemoHandler(FileSystemEventHandler):
@@ -371,7 +432,10 @@ def scan_existing_files() -> None:
         process_file(file_path)
 
 
-RETRANSCRIBE_POLL_INTERVAL = 30  # 秒
+RETRANSCRIBE_POLL_INTERVAL = 30   # 秒
+SCP_RETRY_INTERVAL        = 300  # 秒（5分おき）
+SCAN_TRIGGER_POLL_INTERVAL = 15  # 秒（手動スキャントリガーの確認間隔）
+SCP_PENDING_FILE = LOG_DIR / "scp_pending.jsonl"
 
 
 def process_retranscribe_job(conn, job: dict) -> None:
@@ -539,6 +603,50 @@ def main() -> None:
     retranscribe_thread = threading.Thread(target=_retranscribe_loop, daemon=True)
     retranscribe_thread.start()
     logger.info("再文字起こしジョブポーリング開始 (interval=%ds)", RETRANSCRIBE_POLL_INTERVAL)
+
+    # SCP保留リトライスレッド
+    def _scp_retry_loop():
+        while True:
+            time.sleep(SCP_RETRY_INTERVAL)
+            poll_scp_pending()
+
+    scp_retry_thread = threading.Thread(target=_scp_retry_loop, daemon=True)
+    scp_retry_thread.start()
+    logger.info("SCP保留リトライ開始 (interval=%ds)", SCP_RETRY_INTERVAL)
+
+    # 手動スキャントリガー監視スレッド
+    # meelog UI からのスキャン要求を DB 経由で受け取り、scan_existing_files() を実行する
+    def _scan_trigger_loop():
+        while True:
+            time.sleep(SCAN_TRIGGER_POLL_INTERVAL)
+            if not DATABASE_URL:
+                continue
+            try:
+                conn = psycopg2.connect(DATABASE_URL)
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT id FROM settings WHERE key = 'scan_requested' AND user_id = 1"
+                        )
+                        row = cur.fetchone()
+                    if row is None:
+                        continue
+                    # トリガーを消費してからスキャン実行
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "DELETE FROM settings WHERE key = 'scan_requested' AND user_id = 1"
+                        )
+                    conn.commit()
+                finally:
+                    conn.close()
+                logger.info("手動スキャントリガーを検知。ファイルをスキャンします")
+                scan_existing_files()
+            except Exception as e:
+                logger.error("スキャントリガー確認中にエラー: %s", e)
+
+    scan_trigger_thread = threading.Thread(target=_scan_trigger_loop, daemon=True)
+    scan_trigger_thread.start()
+    logger.info("手動スキャントリガー監視開始 (interval=%ds)", SCAN_TRIGGER_POLL_INTERVAL)
 
     # FSEvents 監視開始
     event_handler = VoiceMemoHandler()
