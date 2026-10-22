@@ -384,14 +384,16 @@ class VoiceMemoHandler(FileSystemEventHandler):
             process_file(Path(event.dest_path))
 
 
-RECENT_FILE_HOURS = 24  # 起動時に未処理として自動処理する対象のファイル作成からの時間
+RECENT_FILE_HOURS = 24        # 起動時スキャンの遡り時間（時間）
+MANUAL_SCAN_FILE_HOURS = 168  # 手動スキャンボタン時の遡り時間（7日間）
 
 
-def scan_existing_files() -> None:
-    """起動時に既存ファイルを DB ハッシュと照合し、最近の未処理ファイルを自動処理する。"""
-    import stat
+def scan_existing_files(max_age_hours: float = RECENT_FILE_HOURS) -> None:
+    """既存ファイルを DB ハッシュと照合し、未処理ファイルを自動処理する。
 
-    logger.info("既存ファイルのスキャン開始: %s", WATCH_DIR)
+    max_age_hours: この時間以内に更新されたファイルを対象にする（デフォルト24h、手動スキャン時は7日）
+    """
+    logger.info("既存ファイルのスキャン開始 (遡り: %.0fh): %s", max_age_hours, WATCH_DIR)
     audio_files = []
     for ext in SUPPORTED_EXTENSIONS:
         audio_files.extend(WATCH_DIR.rglob(f"*{ext}"))
@@ -411,7 +413,7 @@ def scan_existing_files() -> None:
                 logger.debug("既処理済み（スキップ）: %s", file_path.name)
             else:
                 age_hours = (now - file_path.stat().st_mtime) / 3600
-                if age_hours <= RECENT_FILE_HOURS:
+                if age_hours <= max_age_hours:
                     logger.info(
                         "未処理ファイル検出（自動処理します）: %s (%.1fh前)",
                         file_path.name, age_hours,
@@ -428,7 +430,7 @@ def scan_existing_files() -> None:
     logger.info("既存ファイルのスキャン完了（自動処理対象: %d件）", len(recent_unprocessed))
 
     for file_path in recent_unprocessed:
-        logger.info("起動時リトライ処理: %s", file_path.name)
+        logger.info("スキャン処理: %s", file_path.name)
         process_file(file_path)
 
 
@@ -639,8 +641,8 @@ def main() -> None:
                     conn.commit()
                 finally:
                     conn.close()
-                logger.info("手動スキャントリガーを検知。ファイルをスキャンします")
-                scan_existing_files()
+                logger.info("手動スキャントリガーを検知。過去 %.0fh 分のファイルをスキャンします", MANUAL_SCAN_FILE_HOURS)
+                scan_existing_files(max_age_hours=MANUAL_SCAN_FILE_HOURS)
             except Exception as e:
                 logger.error("スキャントリガー確認中にエラー: %s", e)
 
