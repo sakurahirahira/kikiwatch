@@ -388,23 +388,43 @@ RECENT_FILE_HOURS = 24        # 起動時スキャンの遡り時間（時間）
 MANUAL_SCAN_FILE_HOURS = 168  # 手動スキャンボタン時の遡り時間（7日間）
 
 
-def scan_existing_files(max_age_hours: float = RECENT_FILE_HOURS) -> None:
-    """既存ファイルを DB ハッシュと照合し、未処理ファイルを自動処理する。
+def _set_scan_status(status: str, found: int = 0, processed: int = 0) -> None:
+    """スキャン状態を DB に書き込む（UI の進捗表示用）。"""
+    import json as _json
+    if not DATABASE_URL:
+        return
+    data = _json.dumps({"status": status, "found": found, "processed": processed}, ensure_ascii=False)
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO settings (key, user_id, value, updated_at)
+                    VALUES ('scan_status', 1, %s, NOW())
+                    ON CONFLICT (key, user_id) DO UPDATE SET value = %s, updated_at = NOW()
+                    """,
+                    (data, data),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("scan_status 更新エラー: %s", e)
 
-    max_age_hours: この時間以内に更新されたファイルを対象にする（デフォルト24h、手動スキャン時は7日）
-    """
-    logger.info("既存ファイルのスキャン開始 (遡り: %.0fh): %s", max_age_hours, WATCH_DIR)
+
+def find_unprocessed_files(max_age_hours: float = RECENT_FILE_HOURS) -> list:
+    """未処理の音声ファイルを検索してリストで返す。"""
+    logger.info("未処理ファイル検索 (遡り: %.0fh): %s", max_age_hours, WATCH_DIR)
     audio_files = []
     for ext in SUPPORTED_EXTENSIONS:
         audio_files.extend(WATCH_DIR.rglob(f"*{ext}"))
-    logger.info("既存音声ファイル数: %d", len(audio_files))
 
     now = time.time()
-    recent_unprocessed = []
+    unprocessed = []
     for file_path in audio_files:
         try:
             file_hash = compute_md5(file_path)
-            # .qtaは変換後の.m4aファイル名でN100パスを照合
             target_name = (file_path.stem + ".m4a"
                            if file_path.suffix.lower() == ".qta"
                            else file_path.name)
@@ -414,22 +434,20 @@ def scan_existing_files(max_age_hours: float = RECENT_FILE_HOURS) -> None:
             else:
                 age_hours = (now - file_path.stat().st_mtime) / 3600
                 if age_hours <= max_age_hours:
-                    logger.info(
-                        "未処理ファイル検出（自動処理します）: %s (%.1fh前)",
-                        file_path.name, age_hours,
-                    )
-                    recent_unprocessed.append(file_path)
+                    logger.info("未処理ファイル検出: %s (%.1fh前)", file_path.name, age_hours)
+                    unprocessed.append(file_path)
                 else:
-                    logger.debug(
-                        "未処理ファイル（古いためスキップ）: %s (%.0fh前)",
-                        file_path.name, age_hours,
-                    )
+                    logger.debug("未処理ファイル（古いためスキップ）: %s (%.0fh前)", file_path.name, age_hours)
         except Exception as e:
             logger.warning("既存ファイルスキャン中にエラー: %s - %s", file_path.name, e)
+    return unprocessed
 
-    logger.info("既存ファイルのスキャン完了（自動処理対象: %d件）", len(recent_unprocessed))
 
-    for file_path in recent_unprocessed:
+def scan_existing_files(max_age_hours: float = RECENT_FILE_HOURS) -> None:
+    """既存ファイルを DB ハッシュと照合し、未処理ファイルを自動処理する（起動時スキャン用）。"""
+    unprocessed = find_unprocessed_files(max_age_hours)
+    logger.info("スキャン完了（自動処理対象: %d件）", len(unprocessed))
+    for file_path in unprocessed:
         logger.info("スキャン処理: %s", file_path.name)
         process_file(file_path)
 
@@ -642,7 +660,15 @@ def main() -> None:
                 finally:
                     conn.close()
                 logger.info("手動スキャントリガーを検知。過去 %.0fh 分のファイルをスキャンします", MANUAL_SCAN_FILE_HOURS)
-                scan_existing_files(max_age_hours=MANUAL_SCAN_FILE_HOURS)
+                _set_scan_status("scanning")
+                unprocessed = find_unprocessed_files(max_age_hours=MANUAL_SCAN_FILE_HOURS)
+                found = len(unprocessed)
+                logger.info("手動スキャン: %d件の未処理ファイルを発見", found)
+                _set_scan_status("processing", found=found, processed=0)
+                for i, file_path in enumerate(unprocessed):
+                    process_file(file_path)
+                    _set_scan_status("processing", found=found, processed=i + 1)
+                _set_scan_status("completed", found=found, processed=found)
             except Exception as e:
                 logger.error("スキャントリガー確認中にエラー: %s", e)
 
