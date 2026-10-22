@@ -325,10 +325,18 @@ def poll_scp_pending() -> None:
             pass
 
 
+_INTERNAL_FILE_PREFIXES = ("composedAsset", "Composition", "trimmedAsset")
+
+
 def process_file(file_path: Path) -> None:
     """新規音声ファイルを処理する（.m4a / .qta 対応）。"""
     ext = file_path.suffix.lower()
     if ext not in SUPPORTED_EXTENSIONS:
+        return
+
+    # Voice Memos の内部ファイル（編集用合成ファイル等）はスキップ
+    if file_path.stem.startswith(_INTERNAL_FILE_PREFIXES):
+        logger.debug("Voice Memos 内部ファイルをスキップ: %s", file_path.name)
         return
 
     logger.info("新規ファイル検知: %s", file_path.name)
@@ -423,6 +431,9 @@ def find_unprocessed_files(max_age_hours: float = RECENT_FILE_HOURS) -> list:
     now = time.time()
     unprocessed = []
     for file_path in audio_files:
+        if file_path.stem.startswith(_INTERNAL_FILE_PREFIXES):
+            logger.debug("Voice Memos 内部ファイルをスキップ: %s", file_path.name)
+            continue
         try:
             file_hash = compute_md5(file_path)
             target_name = (file_path.stem + ".m4a"
@@ -646,7 +657,7 @@ def main() -> None:
                 try:
                     with conn.cursor() as cur:
                         cur.execute(
-                            "SELECT id FROM settings WHERE key = 'scan_requested' AND user_id = 1"
+                            "SELECT 1 FROM settings WHERE key = 'scan_requested' AND user_id = 1"
                         )
                         row = cur.fetchone()
                     if row is None:
