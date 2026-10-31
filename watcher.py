@@ -395,6 +395,24 @@ class VoiceMemoHandler(FileSystemEventHandler):
 RECENT_FILE_HOURS = 24        # 起動時スキャンの遡り時間（時間）
 MANUAL_SCAN_FILE_HOURS = 168  # 手動スキャンボタン時の遡り時間（7日間）
 
+VOICEMEMOS_APP = "/System/Applications/VoiceMemos.app"
+VOICEMEMOS_SYNC_WAIT = 12  # 起動後に iCloud 同期が始まるまでの待機秒数
+
+
+def _ensure_voicememos_running() -> None:
+    """VoiceMemos が停止中なら起動して iCloud 同期（+キャッシュリセット）を促す。"""
+    try:
+        result = subprocess.run(["pgrep", "-x", "VoiceMemos"], capture_output=True)
+        if result.returncode != 0:
+            logger.info("VoiceMemos が停止中のため起動します（iCloud 同期 + キャッシュリセットのため）")
+            subprocess.Popen(["open", VOICEMEMOS_APP])
+            time.sleep(VOICEMEMOS_SYNC_WAIT)
+            logger.info("VoiceMemos 起動・同期待機完了")
+        else:
+            logger.debug("VoiceMemos は既に起動中")
+    except Exception as e:
+        logger.warning("VoiceMemos 起動チェック失敗: %s", e)
+
 
 def _set_scan_status(status: str, found: int = 0, processed: int = 0) -> None:
     """スキャン状態を DB に書き込む（UI の進捗表示用）。"""
@@ -622,6 +640,9 @@ def main() -> None:
     logger.info("kikitoru コマンド: %s", KIKITORU_CMD)
     logger.info("ログファイル: %s", LOG_FILE)
 
+    # VoiceMemos 起動確認（iCloud 同期 + キャッシュリセット）
+    _ensure_voicememos_running()
+
     # 既存ファイルスキャン
     scan_existing_files()
 
@@ -672,6 +693,7 @@ def main() -> None:
                     conn.close()
                 logger.info("手動スキャントリガーを検知。過去 %.0fh 分のファイルをスキャンします", MANUAL_SCAN_FILE_HOURS)
                 _set_scan_status("scanning")
+                _ensure_voicememos_running()
                 unprocessed = find_unprocessed_files(max_age_hours=MANUAL_SCAN_FILE_HOURS)
                 found = len(unprocessed)
                 logger.info("手動スキャン: %d件の未処理ファイルを発見", found)
