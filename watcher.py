@@ -495,6 +495,7 @@ def process_retranscribe_job(conn, job: dict) -> None:
     model = job["model"]
     clustering_threshold = job["clustering_threshold"]
     normalize = job["normalize"]
+    enhance = job.get("enhance", False)
 
     def update_job(status=None, phase=None, progress=None, error=None):
         fields, values = [], []
@@ -542,7 +543,9 @@ def process_retranscribe_job(conn, job: dict) -> None:
             update_job(phase="文字起こし中", progress=8)
 
             # kikitoru コマンド構築
-            cmd = ["caffeinate", "-i", KIKITORU_CMD, "transcribe", "--use-db", str(local_tmp), "--enhance"]
+            cmd = ["caffeinate", "-i", KIKITORU_CMD, "transcribe", "--use-db", str(local_tmp)]
+            if enhance:
+                cmd.append("--enhance")
             if normalize:
                 cmd.append("--normalize")
             if model:
@@ -607,7 +610,8 @@ def poll_retranscribe_jobs() -> None:
         try:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT id, recording_id, model, clustering_threshold, normalize
+                    SELECT id, recording_id, model, clustering_threshold, normalize,
+                           COALESCE(enhance, FALSE)
                     FROM retranscribe_jobs
                     WHERE status = 'pending'
                     ORDER BY created_at
@@ -618,7 +622,8 @@ def poll_retranscribe_jobs() -> None:
                 return
             job = {
                 "id": row[0], "recording_id": row[1],
-                "model": row[2], "clustering_threshold": row[3], "normalize": row[4],
+                "model": row[2], "clustering_threshold": row[3],
+                "normalize": row[4], "enhance": row[5],
             }
             process_retranscribe_job(conn, job)
         finally:
