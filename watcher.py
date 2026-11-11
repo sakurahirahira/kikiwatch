@@ -578,8 +578,23 @@ def process_retranscribe_job(conn, job: dict) -> None:
 
             logger.info("再文字起こし開始: recording_id=%d job_id=%s", recording_id, job_id)
             proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            output_lines = []
+            last_chunk_progress = 40  # [3/4] 到達時点
             for line in proc.stdout:
                 line = line.rstrip()
+                output_lines.append(line)
+                # チャンク単位の進捗（40%〜75%の範囲で更新、5%刻み）
+                if line.startswith("[chunk "):
+                    try:
+                        parts = line[7:].split("/")
+                        done, total_chunks = int(parts[0]), int(parts[1])
+                        chunk_progress = 40 + int((done / total_chunks) * 35)
+                        if chunk_progress >= last_chunk_progress + 5:
+                            last_chunk_progress = chunk_progress
+                            update_job(phase="文字起こし中", progress=chunk_progress)
+                    except (ValueError, IndexError):
+                        pass
+                    continue
                 for key, phase, progress in phase_map:
                     if key in line:
                         update_job(phase=phase, progress=progress)
@@ -590,8 +605,9 @@ def process_retranscribe_job(conn, job: dict) -> None:
                 update_job(status="completed", phase="完了", progress=100)
                 logger.info("再文字起こし完了: recording_id=%d", recording_id)
             else:
+                tail = "\n".join(output_lines[-80:])
                 update_job(status="failed", error=f"kikitoru returncode={proc.returncode}")
-                logger.error("再文字起こし失敗: recording_id=%d returncode=%d", recording_id, proc.returncode)
+                logger.error("再文字起こし失敗: recording_id=%d returncode=%d\n%s", recording_id, proc.returncode, tail)
 
     except Exception as e:
         logger.error("再文字起こしジョブエラー: %s", e)
